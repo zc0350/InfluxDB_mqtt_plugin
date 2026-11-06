@@ -32,9 +32,9 @@ dev = ["build", "twine"]
 mqtt-influx-bridge = "mqtt_influx_bridge.__main__:main"
 
 [project.urls]
-Homepage = "https://github.com/OWNER/InfluxDB_mqtt_plugin"
-Repository = "https://github.com/OWNER/InfluxDB_mqtt_plugin"
-Issues = "https://github.com/OWNER/InfluxDB_mqtt_plugin/issues"
+Homepage = "https://github.com/zc0350/InfluxDB_mqtt_plugin"
+Repository = "https://github.com/zc0350/InfluxDB_mqtt_plugin"
+Issues = "https://github.com/zc0350/InfluxDB_mqtt_plugin/issues"
 
 [tool.setuptools.packages.find]
 include = ["mqtt_influx_bridge*"]
