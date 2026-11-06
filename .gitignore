@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+data/
+config.toml
+*.db
+*.db-wal
+*.db-shm
+
+# 构建产物
+dist/
+build/
+*.egg-info/
+.pybuild/
+
+# 本地运维/记忆目录
+.workbuddy/
+*.log

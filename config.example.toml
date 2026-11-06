@@ -1,0 +1,58 @@
+# 复制为 config.toml 后修改。敏感值建议用环境变量覆盖（见 README）。
+[mqtt]
+host = "127.0.0.1"
+port = 1883
+topics = ["sensors/+/telemetry"]
+qos = 1
+client_id = "influx-mqtt-bridge-01"   # 必须固定且全局唯一，持久会话靠它恢复
+persistent_session = true
+username = ""
+password = ""
+keepalive = 60
+tls_ca = ""                           # CA 证书路径；配置后启用 TLS
+tls_cert = ""                         # 双向 TLS 客户端证书
+tls_key = ""                          # 双向 TLS 私钥
+insecure_skip_verify = false
+
+[influx]
+version = "v3"                        # v1 | v2 | v3
+url = "http://127.0.0.1:8181"         # v1/v2 默认 8086
+database = "sensors"                  # v3=db / v1=db / v2=bucket
+org = ""                              # v2 必填
+token = ""                            # 建议用 INFLUX_TOKEN 环境变量
+username = ""                         # v1 basic auth
+password = ""
+timeout_seconds = 10
+no_sync = false                       # v3；false = InfluxDB WAL 持久化后才返回 2xx
+accept_partial = false                # v3；false = 整批原子，避免部分成功后重试造成重复点
+gzip = true
+insecure_skip_verify = false
+
+[format]
+type = "json"                         # json | lineprotocol
+measurement = "sensor_data"
+# measurement_path = "type"          # 可选：从 payload 动态取表名
+timestamp_path = "ts"                # 必填：从 payload 取时间戳，保证重投幂等
+timestamp_unit = "ms"                # ns | us | ms | s | auto | datetime
+static_tags = { source = "mqtt" }
+tags = { device = "device_id", site = "location" }   # tag 名 = payload 路径
+fields = { temperature = "temp:float", humidity = "hum:float", online = "online:bool", seq = "seq:int" }
+topic_tags = { device_from_topic = 1 }               # tag 名 = topic 分段下标
+
+[wal]
+path = "./data/bridge.db"
+max_pending = 500000                  # 高水位；超出后暂不 ACK，借 broker 未确认窗口背压
+
+[writer]
+batch_size = 1000
+flush_interval_ms = 200
+retry_base_ms = 500
+retry_max_ms = 30000
+max_retries = 0                       # 0 = 无限重试；超限转入 DLQ
+ack_mode = "persisted"                # persisted | written（见 README）
+ack_timeout_seconds = 120
+when_full = "block"                   # block = 等待并暂不 ACK；drop = 转 DLQ 后 ACK
+
+[log]
+level = "INFO"
+stats_interval_seconds = 30

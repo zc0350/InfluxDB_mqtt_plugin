@@ -1,0 +1,147 @@
+"""InfluxDB HTTP 写入客户端与批量刷写逻辑（v1 / v2 / v3 端点自适应）。"""
+from __future__ import annotations
+
+import base64
+import gzip
+import http.client
+import logging
+import ssl
+from urllib.parse import urlencode, urlsplit
+
+from .config import InfluxConfig, WriterConfig
+from .wal import Row, Wal
+
+log = logging.getLogger(__name__)
+
+
+class TransientError(Exception):
+    """可重试：网络错误、5xx、429。"""
+
+
+class PermanentError(Exception):
+    """不可重试：4xx（鉴权、schema 冲突、非法 line protocol）。"""
+
+
+class HttpClient:
+    """基于标准库 http.client 的 keep-alive 客户端，无第三方依赖。"""
+
+    def __init__(self, base_url: str, timeout: float = 10.0, insecure: bool = False):
+        u = urlsplit(base_url.rstrip("/"))
+        if u.scheme not in ("http", "https"):
+            raise ValueError(f"influx.url 必须是 http/https: {base_url}")
+        self.scheme = u.scheme
+        self.host = u.hostname or "127.0.0.1"
+        self.port = u.port or (443 if u.scheme == "https" else 80)
+        self.base_path = u.path.rstrip("/")
+        self.timeout = timeout
+        self._context = ssl._create_unverified_context() if (insecure and u.scheme == "https") else None
+        self._conn: http.client.HTTPConnection | None = None
+
+    def _new_conn(self) -> http.client.HTTPConnection:
+        if self.scheme == "https":
+            return http.client.HTTPSConnection(
+                self.host, self.port, timeout=self.timeout, context=self._context
+            )
+        return http.client.HTTPConnection(self.host, self.port, timeout=self.timeout)
+
+    def post(self, path: str, body: bytes, headers: dict[str, str]) -> tuple[int, bytes]:
+        if self._conn is None:
+            self._conn = self._new_conn()
+        try:
+            self._conn.request("POST", self.base_path + path, body=body, headers=headers)
+            resp = self._conn.getresponse()
+            data = resp.read()
+            return resp.status, data
+        except (OSError, http.client.HTTPException, ssl.SSLError) as e:
+            self.close()
+            raise TransientError(f"HTTP 请求失败: {e}") from e
+
+    def close(self) -> None:
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+
+
+class InfluxWriter:
+    def __init__(self, cfg: InfluxConfig, http: HttpClient | None = None):
+        self.cfg = cfg
+        self.http = http or HttpClient(cfg.url, cfg.timeout_seconds, cfg.insecure_skip_verify)
+
+    def endpoint(self) -> str:
+        if self.cfg.version == "v3":
+            params = {
+                "db": self.cfg.database,
+                "precision": "nanosecond",
+                "no_sync": "true" if self.cfg.no_sync else "false",
+                "accept_partial": "true" if self.cfg.accept_partial else "false",
+            }
+            return "/api/v3/write_lp?" + urlencode(params)
+        if self.cfg.version == "v2":
+            params = {"org": self.cfg.org, "bucket": self.cfg.database, "precision": "ns"}
+            return "/api/v2/write?" + urlencode(params)
+        return "/write?" + urlencode({"db": self.cfg.database, "precision": "ns"})
+
+    def headers(self) -> dict[str, str]:
+        h = {"Content-Type": "text/plain; charset=utf-8"}
+        if self.cfg.version == "v1" and self.cfg.username:
+            raw = f"{self.cfg.username}:{self.cfg.password}".encode()
+            h["Authorization"] = "Basic " + base64.b64encode(raw).decode()
+        elif self.cfg.version == "v2" and self.cfg.token:
+            h["Authorization"] = f"Token {self.cfg.token}"
+        elif self.cfg.version == "v3" and self.cfg.token:
+            h["Authorization"] = f"Bearer {self.cfg.token}"
+        if self.cfg.gzip:
+            h["Content-Encoding"] = "gzip"
+        return h
+
+    def write(self, lines: list[str]) -> None:
+        body = "\n".join(lines).encode("utf-8")
+        if self.cfg.gzip:
+            body = gzip.compress(body)
+        status, data = self.http.post(self.endpoint(), body, self.headers())
+        if status in (200, 201, 204):
+            return
+        snippet = data[:400].decode("utf-8", "replace")
+        if 400 <= status < 500 and status not in (408, 429):
+            raise PermanentError(f"HTTP {status}: {snippet}")
+        raise TransientError(f"HTTP {status}: {snippet}")
+
+    def close(self) -> None:
+        self.http.close()
+
+
+def flush_once(
+    wal: Wal,
+    writer: InfluxWriter,
+    cfg: WriterConfig,
+    on_result=None,
+) -> int:
+    """取一批 pending -> 批量写入 -> 删除 / 退避 / 死信。返回处理的行数。"""
+    rows: list[Row] = wal.fetch(cfg.batch_size)
+    if not rows:
+        return 0
+    ids = [r.id for r in rows]
+    try:
+        writer.write([r.line for r in rows])
+    except PermanentError as e:
+        wal.to_dlq(rows, f"permanent: {e}")
+        outcome = "dlq"
+        log.error("整批写入被拒绝，%d 行转入 DLQ：%s", len(rows), e)
+    except TransientError as e:
+        if cfg.max_retries and any(r.attempts + 1 >= cfg.max_retries for r in rows):
+            wal.to_dlq(rows, f"retry limit: {e}")
+            outcome = "dlq"
+            log.error("重试次数超限，%d 行转入 DLQ", len(rows))
+        else:
+            wal.defer(ids, cfg.retry_base_ms, cfg.retry_max_ms)
+            outcome = "retry"
+            log.warning("写入失败，%d 行退避重试：%s", len(rows), e)
+    else:
+        wal.delete(ids)
+        outcome = "ok"
+    if on_result:
+        on_result(outcome, ids)
+    return len(rows)

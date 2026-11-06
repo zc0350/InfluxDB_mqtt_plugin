@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号（仅手动触发打包，不发布 Release）"
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build backend
+        run: python -m pip install --upgrade pip build
+
+      - name: Build wheel + sdist
+        run: python -m build
+
+      - name: Bundle deployable zip
+        run: |
+          VERSION="${GITHUB_REF_NAME:-${INPUT_VERSION:-snapshot}}"
+          rm -rf dist/bundle && mkdir -p dist/bundle/mqtt_influx_bridge
+          cp -r mqtt_influx_bridge/*.py dist/bundle/mqtt_influx_bridge/ 2>/dev/null || true
+          cp config.example.toml README.md requirements.txt LICENSE dist/bundle/
+          find dist/bundle -name '__pycache__' -type d -prune -exec rm -rf {} +
+          cd dist/bundle
+          zip -r "../mqtt-influx-bridge-${VERSION}.zip" .
+          cd ../..
+
+      - name: Publish to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/mqtt-influx-bridge-*.zip
+          generate_release_notes: true
+
+      - name: Upload build artifacts (every run)
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-${{ github.ref_name }}
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/mqtt-influx-bridge-*.zip
+          if-no-files-found: error

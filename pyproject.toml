@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mqtt-influx-bridge"
+version = "0.1.0"
+description = "常驻 MQTT 订阅 -> 本地 SQLite WAL -> 批量写入 InfluxDB 的自研桥接器"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "zc", email = "zc@cz9.cn" }]
+keywords = ["influxdb", "mqtt", "bridge", "telegraf", "timeseries", "iot"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: System :: Networking",
+]
+dependencies = [
+    "paho-mqtt>=2.0,<3",
+]
+
+[project.optional-dependencies]
+dev = ["build", "twine"]
+
+[project.scripts]
+mqtt-influx-bridge = "mqtt_influx_bridge.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/OWNER/InfluxDB_mqtt_plugin"
+Repository = "https://github.com/OWNER/InfluxDB_mqtt_plugin"
+Issues = "https://github.com/OWNER/InfluxDB_mqtt_plugin/issues"
+
+[tool.setuptools.packages.find]
+include = ["mqtt_influx_bridge*"]
+
+[tool.setuptools.package-data]
+mqtt_influx_bridge = ["py.typed"]
