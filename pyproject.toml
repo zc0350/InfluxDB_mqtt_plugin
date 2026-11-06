@@ -8,13 +8,12 @@ version = "0.1.0"
 description = "常驻 MQTT 订阅 -> 本地 SQLite WAL -> 批量写入 InfluxDB 的自研桥接器"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = "MIT"
 authors = [{ name = "zc", email = "zc@cz9.cn" }]
 keywords = ["influxdb", "mqtt", "bridge", "telegraf", "timeseries", "iot"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
