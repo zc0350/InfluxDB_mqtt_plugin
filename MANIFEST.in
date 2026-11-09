@@ -2,3 +2,7 @@ include README.md
 include LICENSE
 include requirements.txt
 include config.example.toml
+include config.tt1000.toml
+include deploy.md
+recursive-include deploy *.yml *.sh *.conf *.example *.toml
+include deploy/Dockerfile.bridge

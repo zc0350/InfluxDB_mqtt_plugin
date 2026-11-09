@@ -1,0 +1,20 @@
+# 构建上下文是仓库根目录（deploy/docker-compose.yml 里 context: ..），
+# 不排除这些会把 .git / 数据文件 / 构建产物一起塞进镜像上下文。
+.git
+.github
+.workbuddy
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+data/
+dist/
+build/
+*.egg-info/
+*.db
+*.db-wal
+*.db-shm
+*.log
+tests/
+deploy/
+config.toml

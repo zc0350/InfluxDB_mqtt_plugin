@@ -6,7 +6,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from mqtt_influx_bridge.bridge import Bridge
-from mqtt_influx_bridge.config import Config, FormatConfig, InfluxConfig, MqttConfig, WalConfig, WriterConfig
+from mqtt_influx_bridge.config import (
+    Config, InfluxConfig, MqttConfig, RouteConfig, WalConfig, WriterConfig,
+)
 from mqtt_influx_bridge.writer import flush_once
 from tests._http_server import MockState, start_mock_server
 
@@ -57,11 +59,13 @@ class TestBridgeOffline(unittest.TestCase):
                 version="v3", url=f"http://127.0.0.1:{self.srv.server_address[1]}",
                 database="sensors", gzip=False,
             ),
-            format=FormatConfig(
-                type="json", measurement="sensor_data", timestamp_path="ts", timestamp_unit="ms",
+            routes=[RouteConfig(
+                name="telemetry", topics=["sensors/+/telemetry"], measurement="sensor_data",
+                year_table=False, timestamp_path="ts", timestamp_unit="ms",
                 static_tags={"source": "mqtt"}, tags={"device": "device_id"},
                 fields={"temperature": "temp:float", "seq": "seq:int"},
-            ),
+                blob_field="", topic_field="",
+            )],
             wal=WalConfig(path=str(Path(self.tmp.name) / "q.db")),
             writer=WriterConfig(batch_size=10, ack_mode="persisted", retry_base_ms=0, retry_max_ms=0),
         )
@@ -143,9 +147,32 @@ class TestBridgeOffline(unittest.TestCase):
         self.assertEqual(self.fake.acks, [])             # 超限：不 ACK，等 broker 重投
         self.assertEqual(self.bridge.wal.pending_count(), 1)
 
+    def test_unrouted_topic_lands_in_dlq_and_acks(self):
+        self.bridge.on_message(self.fake, None, FakeMsg("sensors/dev-01/other", PAYLOAD))
+        self.assertEqual(self.fake.acks, [(1, 1)])
+        self.assertEqual(self.bridge.wal.stats()["dlq"], 1)
+        self.assertIn("没有 [[route]] 匹配", self.bridge.wal.dlq_rows()[0][3])
+
     def test_on_connect_subscribes_with_version2_signature(self):
         self.bridge.on_connect(self.fake, None, {}, 0, None)
         self.assertEqual(self.fake.subscriptions, [("sensors/+/telemetry", 1)])
+
+    def test_routes_are_effective_through_the_whole_chain(self):
+        """真实场景 payload：占位符展开与按年表名都要体现在实际写入体里。"""
+        self.cfg.routes = [RouteConfig(
+            name="uplink", topics=["${productKey}/+/data"], measurement="mqtt_data",
+            timestamp_path="time", timestamp_unit="auto",
+            tags={"event": "event", "devicecode": "deviceCode"},
+        )]
+        self.cfg.mapping.substitutions = {"productKey": "TT1000"}
+        payload = (b'{"event":"status","deviceCode":"TT10002","imei":"864925080140265",'
+                   b'"sigal": 25,"server_id": 1,"version":"mini_esp32_127","time":1793936202}')
+        self.bridge.on_message(self.fake, None, FakeMsg("TT1000/TT10002/data", payload))
+        self._flush()
+        body = self.state.requests[-1]["body"]
+        self.assertTrue(body.startswith("mqtt_data_2026,event=status,devicecode=TT10002 "), body)
+        self.assertIn("sigal=25.0", body)
+        self.assertIn("1793936202000000000", body)
 
 
 if __name__ == "__main__":

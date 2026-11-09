@@ -1,0 +1,25 @@
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN useradd --system --uid 10001 --create-home bridge
+
+WORKDIR /app
+COPY requirements.txt ./
+RUN pip install -r requirements.txt
+
+COPY pyproject.toml README.md LICENSE MANIFEST.in ./
+COPY mqtt_influx_bridge ./mqtt_influx_bridge
+RUN pip install --no-deps .
+
+# WAL 目录必须在镜像里就属主正确：命名卷首次挂载会继承镜像内目录的 owner
+RUN mkdir -p /data /config && chown -R bridge:bridge /data /config
+
+USER bridge
+ENV BRIDGE_CONFIG=/config/config.toml
+VOLUME ["/data"]
+
+ENTRYPOINT ["mqtt-influx-bridge"]
+CMD ["run"]

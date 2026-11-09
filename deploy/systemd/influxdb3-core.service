@@ -1,0 +1,137 @@
+# InfluxDB 3 Core —— systemd 服务单元（bare-metal / tarball 安装用）
+#
+# 装官方 DEB/RPM 时包里已经带了同名 unit `influxdb3-core`（配置 /etc/influxdb3/influxdb3-core.conf，
+# 数据目录 /var/lib/influxdb3/data）。那种情况下**不要覆盖它**，用 drop-in：
+#     systemctl edit influxdb3-core      # → /etc/systemd/system/influxdb3-core.service.d/override.conf
+#     systemctl daemon-reload && systemctl restart influxdb3-core
+# 本文件用于 tarball 安装（/usr/local/bin/influxdb3）或需要完全掌控启动参数的场景；
+# 路径参数与官方包保持一致，两条路线可互换。
+#
+# 关键约束：`influxdb3 serve` **不支持配置热加载**，改参数/环境变量只能 restart。
+
+[Unit]
+Description=InfluxDB 3 Core (single-node, Arrow/Parquet engine)
+Documentation=https://docs.influxdata.com/influxdb3/core/install/
+Documentation=https://docs.influxdata.com/influxdb3/core/reference/config-options/
+After=network-online.target local-fs.target remote-fs.target
+Wants=network-online.target
+# 注意：StartLimit* 属于 [Unit] 段。写进 [Service] 会被 systemd 忽略
+# （journal 里是 "Unknown key 'StartLimitIntervalSec' in section [Service], ignoring"），
+# 后果是崩溃循环不被封住 —— 实测有一台机器 restart counter 涨到 48 还在 auto-restart。
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=influxdb3
+Group=influxdb3
+
+# 内存预算：本机 32G，配平为「Core 独占 20G」（MemoryMax=20G + 下面三个绝对值 flag）。
+# 换机器时这两处必须一起改 —— Core 的内存 flag 默认值是**整机总内存的百分比**
+# （--exec-mem-pool-size 20% / --force-snapshot-mem-size 50% / --file-cache-size 20%），
+# 只压 cgroup 不给绝对值，进程会按大内存机器去申请、然后被 cgroup OOM kill，
+# 在桥接器侧的表现是一片 connection refused，很容易被误判成网络故障。
+#
+# 32G 不写死的话默认值是 6.4G / 16G / 6.4G（合计 28G，比任何合理的 cgroup 上限都大）。
+#   exec-pool 6gb   —— 全局池（query processing 共用），并发查询在池内互抢，
+#                      不随 --max-concurrent-queries 线性放大，所以 6G 是总量不是单查询配额
+#   snapshot 6gb    —— 默认 16G 等于让 WAL 内存缓冲吃掉几乎整个上限；但**不要往小调**：
+#                      Core 没有 compactor，快照越频繁 → gen1 Parquet 文件越多 → 查询越慢；
+#                      低峰期由 --force-snapshot-max-age（默认 1h）兜住崩溃回放窗口
+#   file-cache 4gb  —— 进程内 Parquet/Arrow 缓存，属匿名内存，不像 page cache 那样可回收
+# 三者最坏 16G，留 4G 给 catalog / tokio / 内嵌 CPython / 碎片。
+# 别再加 --parquet-mem-cache-size：它已降级为 --file-cache-size 的隐藏 alias，重复设只会互相覆盖。
+# 小机器（≤4G，例如测试服 2.9G / 2 vCPU / 无 swap）换成这组，配套 MemoryHigh=1.3G MemoryMax=1.6G：
+#   --exec-mem-pool-size=256mb --force-snapshot-mem-size=384mb --file-cache-size=256mb
+#   --max-concurrent-queries=4 --async-trigger-concurrency-limit=4
+# 判断方法：core 的百分比默认值按**整机内存**算，所以机器的 memory.total 一变，注释掉这几个 flag
+# 就等于悄悄把配额放大/缩小；宁可写死绝对值，也别依赖默认值。
+ExecStart=/usr/local/bin/influxdb3 serve \
+    --node-id=node0 \
+    --object-store=file \
+    --data-dir=/var/lib/influxdb3/data \
+    --http-bind=127.0.0.1:8181 \
+    --without-auth \
+    --exec-mem-pool-size=6gb \
+    --force-snapshot-mem-size=6gb \
+    --file-cache-size=4gb \
+    --max-concurrent-queries=8 \
+    --async-trigger-concurrency-limit=8 \
+    $INFLUXDB3_EXTRA_ARGS
+
+# 留一个空的默认值：EnvironmentFile 缺失时 systemd 会因未定义变量直接拒绝启动
+Environment=INFLUXDB3_EXTRA_ARGS=
+# 额外/试验参数写这里，一个词一个 flag，例：
+#   INFLUXDB3_EXTRA_ARGS=--query-file-limit=1000 --max-concurrent-queries=8
+EnvironmentFile=-/etc/influxdb3/influxdb3-core.env
+
+# StateDirectory 自动创建 /var/lib/influxdb3/data 并 chown 给上面的 User（首启即可用）。
+# 值的语义是「/var/lib 下的相对名」，不是任意绝对路径。
+# ⚠ 这条和下面的 ProtectSystem=strict 是绑死的：strict 会把整个文件系统挂成只读，
+#   只有 StateDirectory / CacheDirectory / LogsDirectory / ReadWritePaths 声明过的路径可写。
+#   一旦把 --data-dir 改到 /var/lib 以外（例如 /var/local/influxdb3/data），
+#   必须同时加 ReadWritePaths=<那个目录>，否则 influxdb3 起来就退出：
+#     Serve command failed: Cannot parse object store config:
+#     Unable to create database directory "...": Read-only file system (os error 30)
+#   这是 EROFS 不是 EACCES —— 目录属主正确也会报，别去查权限。
+# 两个 directive 必须跟着 --data-dir 走，否则一个失效一个白建目录：
+#   data-dir 在 /var/lib/influxdb3/data → 留 StateDirectory=influxdb3/data（会自动建目录 + chown）
+#   data-dir 在别处（如 /var/local/influxdb3/data）→ 用 ReadWritePaths=<那个目录>，
+#     同时把 StateDirectory 注释掉，否则 systemd 白建一个没人用的 /var/lib/influxdb3/data
+# 本 unit 是手写在 /etc/systemd/system 的，直接写在这里就行，不必拆 drop-in；
+# drop-in 只在「主 unit 由 dpkg/rpm 维护、会被升级覆盖」时才是必需的。
+StateDirectory=influxdb3/data
+StateDirectoryMode=0700
+# ReadWritePaths=/var/local/influxdb3
+
+# ---- 生命周期 ----
+Restart=always
+RestartSec=3
+# 崩溃限速（StartLimitIntervalSec / StartLimitBurst）在上面的 [Unit] 段，别挪下来
+
+# SIGTERM 走优雅关闭（WAL flush + snapshot）。超时要盖得住最坏情况的 checkpoint。
+TimeoutStartSec=600
+TimeoutStopSec=120
+KillSignal=SIGTERM
+# 与桥接器 unit 的区别：DB 进程卡死时必须能被杀掉，否则连 restart 都做不了；
+# 被打断的落盘靠重启后的 WAL 回放兜住（代价是开机首启可能多几秒）。
+KillMode=control-group
+
+# ---- fd 与并发 ----
+# gen1 Parquet 文件按 --gen1-duration（默认 10m）只增不合，**Core 没有 compactor**，
+# 文件数随「表数 × 时间」线性上涨；社区有重启时 "Too many open files (os error 24)" 的实测报告，
+# 默认 soft limit 1024 一定会撞，直接抬到 65536。
+LimitNOFILE=65536
+TasksMax=8192
+
+# ---- cgroup 资源护栏（与上面三个内存 flag 配对，见 ExecStart 注释）----
+# 20G = 三个池最坏 16G + 4G 引擎自身开销；剩 12G 给 page cache（Parquet 扫描很依赖它，
+# 故意不给满）、mosquitto、桥接器（那边 unit 是 MemoryMax=512M）和突发。
+# MemoryHigh 先节流并回收，MemoryMax 才真杀 —— 两层都要，别只留一个。
+# 说明：page cache 是可回收内存，内核撞 MemoryMax 前会先回收它，所以这两个值实际约束的是匿名内存。
+MemoryHigh=17G
+MemoryMax=20G
+
+# ---- 加固 ----
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+# 只监听 127.0.0.1 的 TCP + journald 的 unix socket；
+# 若远程查询走反代，或改用 --object-store=s3/google/azure，仍只需 AF_INET
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# 故意不设 MemoryDenyWriteExecute：Core 内嵌 Python VM（Processing Engine），
+# CPython 的 arena/ctypes 需要可写可执行映射，开了会打挂插件路径。
+# 确定不用 Processing Engine 时可以自行补上这条。
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=influxdb3
+
+[Install]
+WantedBy=multi-user.target

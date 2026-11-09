@@ -1,25 +1,16 @@
 from __future__ import annotations
 
-import tempfile
 import unittest
-from pathlib import Path
 
-from mqtt_influx_bridge.config import FormatConfig
-from mqtt_influx_bridge.lineprotocol import ParseError, parse_payload, timestamp_to_ns
-
-
-def json_fmt(**kw) -> FormatConfig:
-    base = dict(
-        type="json",
-        measurement="sensor_data",
-        timestamp_path="ts",
-        timestamp_unit="ms",
-        static_tags={"source": "mqtt"},
-        tags={"device": "device_id", "site": "location"},
-        fields={"temperature": "temp:float", "seq": "seq:int"},
-    )
-    base.update(kw)
-    return FormatConfig(**base)
+from mqtt_influx_bridge.lineprotocol import (
+    ParseError,
+    build_line,
+    format_value,
+    normalize_line,
+    resolve_path,
+    split_field_spec,
+    timestamp_to_ns,
+)
 
 
 class TestTimestamp(unittest.TestCase):
@@ -28,93 +19,99 @@ class TestTimestamp(unittest.TestCase):
         self.assertEqual(timestamp_to_ns(1_638_360_000, "s"), 1_638_360_000_000_000_000)
         self.assertEqual(timestamp_to_ns(1_638_360_000_000_000_000, "ns"), 1_638_360_000_000_000_000)
         self.assertEqual(timestamp_to_ns(1_638_360_000, "auto"), 1_638_360_000_000_000_000)
+        self.assertEqual(timestamp_to_ns(1_638_360_000_000, "auto"), 1_638_360_000_000_000_000)
         self.assertEqual(timestamp_to_ns("2021-12-01T12:00:00Z", "datetime"), 1_638_360_000_000_000_000)
+
+    def test_naive_datetime_treated_as_utc(self):
+        self.assertEqual(timestamp_to_ns("2021-12-01T12:00:00", "datetime"), 1_638_360_000_000_000_000)
 
     def test_bad_timestamp(self):
         with self.assertRaises(ParseError):
             timestamp_to_ns("not-a-number", "ms")
 
-
-class TestJsonFormat(unittest.TestCase):
-    def test_basic_line(self):
-        payload = b'{"ts": 1638360000000, "device_id": "dev-01", "location": "wh", "temp": 22.5, "seq": 7}'
-        lines = parse_payload(payload, json_fmt(), "sensors/dev-01/telemetry")
-        self.assertEqual(
-            lines,
-            ["sensor_data,source=mqtt,device=dev-01,site=wh temperature=22.5,seq=7i 1638360000000000000"],
+    def test_nanosecond_ints_keep_every_digit(self):
+        # int(float()) 时代：1.79e18 附近 float 的最小刻度是 256ns，相邻纳秒会被并成同一个点
+        self.assertEqual(timestamp_to_ns(1_794_228_571_529_000_060, "ns"), 1_794_228_571_529_000_060)
+        self.assertNotEqual(
+            timestamp_to_ns(1_794_228_571_529_000_060, "auto"),
+            timestamp_to_ns(1_794_228_571_529_000_061, "auto"),
         )
+        self.assertEqual(timestamp_to_ns("1794228571529000060", "auto"), 1_794_228_571_529_000_060)
 
-    def test_type_inference_and_nested_path(self):
-        fmt = json_fmt(
-            timestamp_path="meta.ts",
-            fields={"temperature": "meta.temp", "online": "flags.up:bool", "note": "text:str"},
+    def test_sub_second_fractions_survive(self):
+        self.assertEqual(timestamp_to_ns(1_638_360_000.5, "s"), 1_638_360_000_500_000_000)
+        self.assertEqual(timestamp_to_ns("1638360000.123456", "s"), 1_638_360_000_123_456_000)
+        self.assertEqual(timestamp_to_ns("2021-12-01T12:00:00.123456Z", "datetime"), 1_638_360_000_123_456_000)
+
+    def test_bool_and_nan_are_not_timestamps(self):
+        for bad in (True, None, "nan", "inf"):
+            with self.assertRaises(ParseError):
+                timestamp_to_ns(bad, "ms")
+
+
+class TestPathResolution(unittest.TestCase):
+    def test_nested_list_and_topic_placeholder(self):
+        obj = {"a": {"b": 7}, "list": [{"v": 1}, {"v": 2}]}
+        self.assertEqual(resolve_path("a.b", obj, "t"), 7)
+        self.assertEqual(resolve_path("list.1.v", obj, "t"), 2)
+        self.assertIsNone(resolve_path("a.missing", obj, "t"))
+        self.assertEqual(resolve_path("@topic[2]", obj, "pk/dev/cmd"), "cmd")
+        self.assertIsNone(resolve_path("@topic[9]", obj, "pk/dev/cmd"))
+
+    def test_field_spec_split(self):
+        self.assertEqual(split_field_spec("temp:float"), ("temp", "float"))
+        self.assertEqual(split_field_spec("a.b:int"), ("a.b", "int"))
+        self.assertEqual(split_field_spec("temp"), ("temp", "auto"))
+        self.assertEqual(split_field_spec("path:unknown"), ("path:unknown", "auto"))
+
+
+class TestValueFormatting(unittest.TestCase):
+    def test_types(self):
+        self.assertEqual(format_value(1, "auto"), "1i")
+        self.assertEqual(format_value(1.5, "auto"), "1.5")
+        self.assertEqual(format_value(True, "auto"), "true")
+        self.assertEqual(format_value("dev", "auto"), '"dev"')
+        self.assertEqual(format_value(7, "float"), "7.0")
+        self.assertEqual(format_value("25", "int"), "25i")
+        self.assertEqual(format_value("YES", "bool"), "true")
+        self.assertIsNone(format_value(None, "auto"))
+
+    def test_rejects_non_finite_and_unconvertible(self):
+        with self.assertRaises(ParseError):
+            format_value(float("nan"), "float")
+        with self.assertRaises(ParseError):
+            format_value("abc", "int")
+
+    def test_string_field_escapes(self):
+        self.assertEqual(format_value('a "b" c\\d', "str"), '"a \\"b\\" c\\\\d"')
+
+    def test_array_and_object_stringify_as_compact_json(self):
+        # explicit 模式声明的数组列要和 auto 模式同格式（无空格），否则同一列两种写法
+        self.assertEqual(format_value([1, 2], "auto"), '"[1,2]"')
+        self.assertEqual(format_value({"a": 1}, "str"), '"{\\"a\\":1}"')
+
+
+class TestBuildLine(unittest.TestCase):
+    def test_escaping_and_empty_tags(self):
+        line = build_line(
+            "my measure,ment",
+            {"device": "a b,c", "site": "x=y", "empty": ""},
+            {"v": "1.0", 'k ey': '"s"'},
+            1000,
         )
-        payload = b'{"meta": {"ts": 1000, "temp": 3.5}, "flags": {"up": true}, "text": "a \\"quoted\\" value"}'
-        line = parse_payload(payload, fmt, "t")[0]
-        self.assertIn("temperature=3.5", line)
-        self.assertIn("online=true", line)
-        self.assertIn('note="a \\"quoted\\" value"', line)
-        self.assertTrue(line.endswith(" 1000000000"))
-
-    def test_topic_placeholders_and_topic_tags(self):
-        fmt = json_fmt(tags={"device": "@topic[1]"}, topic_tags={"room": 2})
-        line = parse_payload(b'{"ts": 1000, "temp": 1.0, "seq": 1}', fmt, "sensors/dev-9/room3")[0]
-        self.assertIn("device=dev-9", line)
-        self.assertIn("room=room3", line)
-
-    def test_json_array_produces_multiple_lines(self):
-        payload = b'[{"ts": 1000, "temp": 1.0, "seq": 1}, {"ts": 1001, "temp": 2.0, "seq": 2}]'
-        lines = parse_payload(payload, json_fmt(), "sensors/x")
-        self.assertEqual(len(lines), 2)
-        self.assertTrue(lines[0].endswith(" 1000000000"))
-        self.assertTrue(lines[1].endswith(" 1001000000"))
-
-    def test_escaping(self):
-        line = parse_payload(
-            b'{"ts": 1, "temp": 1.0, "seq": 1, "device_id": "a b,c", "location": "x=y"}',
-            json_fmt(measurement="my measure,ment"),
-            "t",
-        )[0]
-        self.assertTrue(line.startswith(r"my\ measure\,ment,"))
-        self.assertIn(r"device=a\ b\,c", line)
-        self.assertIn(r"site=x\=y", line)
-
-    def test_dynamic_measurement(self):
-        line = parse_payload(
-            b'{"ts": 1000, "type": "cpu", "temp": 1.0, "seq": 1}',
-            json_fmt(measurement_path="type"),
-            "t",
-        )[0]
-        self.assertTrue(line.startswith("cpu,"))
-
-    def test_errors(self):
-        with self.assertRaises(ParseError):
-            parse_payload(b"not json", json_fmt(), "t")
-        with self.assertRaises(ParseError):
-            parse_payload(b"   ", json_fmt(), "t")
-        with self.assertRaises(ParseError):
-            parse_payload(b'{"ts": 1000}', json_fmt(), "t")  # 无字段
-        with self.assertRaises(ParseError):
-            parse_payload(b"\xff\xfe", json_fmt(), "t")
+        self.assertTrue(line.startswith(r"my\ measure\,ment,device=a\ b\,c,site=x\=y"))
+        self.assertNotIn("empty", line)
+        self.assertIn(r'k\ ey="s"', line)
+        self.assertTrue(line.endswith(" 1000"))
 
 
-class TestLineProtocolFormat(unittest.TestCase):
+class TestLineProtocolPassthrough(unittest.TestCase):
     def test_appends_missing_timestamp(self):
-        line = parse_payload(b"cpu,host=a usage=1.0", FormatConfig(type="lineprotocol"), "t")[0]
-        self.assertRegex(line, r"^cpu,host=a usage=1\.0 \d{19}$")
+        self.assertRegex(normalize_line("cpu,host=a usage=1.0", "ms"), r"^cpu,host=a usage=1\.0 \d{19}$")
 
     def test_normalizes_existing_timestamp(self):
-        fmt = FormatConfig(type="lineprotocol", timestamp_unit="ms")
-        line = parse_payload(b"cpu,host=a usage=1.0 1000", fmt, "t")[0]
-        self.assertEqual(line, "cpu,host=a usage=1.0 1000000000")
-
-    def test_multiline(self):
-        lines = parse_payload(
-            b"m,h=a v=1 1000\nm,h=b v=2 1001",
-            FormatConfig(type="lineprotocol", timestamp_unit="ms"),
-            "t",
-        )
-        self.assertEqual(len(lines), 2)
+        self.assertEqual(normalize_line("cpu,host=a usage=1.0 1000", "ms"), "cpu,host=a usage=1.0 1000000000")
+        self.assertEqual(normalize_line("cpu usage=1.0 1000", "ns"), "cpu usage=1.0 1000")
 
 
 if __name__ == "__main__":

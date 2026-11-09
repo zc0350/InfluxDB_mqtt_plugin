@@ -1,0 +1,36 @@
+# 鉴权版叠加文件（可选）。默认 docker-compose.yml 用 --without-auth + 只绑 127.0.0.1。
+#
+# 用法：
+#   1) 先按 bootstrap.sh 起无鉴权栈
+#   2) 造 admin token —— 在线创建，token 只在 stdout 打印一次，自己存成文件：
+#        docker compose exec -T influxdb3 influxdb3 create token --admin
+#      把输出存进卷里（serve 重启时要它，否则每次启动换一个新 token，旧的全部失效）：
+#        docker compose exec -T influxdb3 sh -c \
+#          'umask 077; influxdb3 create token --admin > /var/lib/influxdb3/admin.token'
+#      注意：--output-file 是 --offline（不起服务本地造 token）那条路的参数，
+#      在线创建没有「直接写文件」这回事，别照抄社区帖里的 --admin --output-file。
+#   3) token 明文抄进 .env 的 INFLUX_ADMIN_TOKEN 与 bridge.env 的 INFLUX_TOKEN
+#   4) docker compose -f docker-compose.yml -f docker-compose.auth.yml up -d
+#
+# 文件里存的是裸 token 还是 JSON，各版本不一致；serve 重启后先跑
+#   docker compose exec influxdb3 influxdb3 serve --help | grep -i admin-token
+# 核对选项名（3.12 见过 --admin-token-file，更早的版本有 --admin-token 收字符串）。
+# Core 只有 operator / admin 一种管理 token，没有 --permissions 细粒度授权（那是 Clustered/Cloud）。
+
+services:
+  influxdb3:
+    command:
+      - serve
+      - --node-id=${NODE_ID:-node0}
+      - --object-store=file
+      - --data-dir=/var/lib/influxdb3
+      - --admin-token-file=${INFLUX_ADMIN_TOKEN_FILE:-/var/lib/influxdb3/admin.token}
+      # 若本版本只认字符串形式：删掉上面一行，改用
+      # - --admin-token=${INFLUX_ADMIN_TOKEN:?先 create token --admin 并写入 .env}
+    environment:
+      # 容器里的 influxdb3 CLI（create database / delete table / query）默认读这个变量，
+      # 有了它就不用每条命令都拼 --token。
+      - INFLUXDB3_AUTH_TOKEN=${INFLUX_ADMIN_TOKEN:?先在 .env 填 INFLUX_ADMIN_TOKEN}
+    ports:
+      # 启用了鉴权才可以考虑对外监听
+      - "${INFLUXDB3_BIND:-127.0.0.1}:${INFLUXDB3_PORT:-8181}:8181"

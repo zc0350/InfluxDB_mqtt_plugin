@@ -1,0 +1,38 @@
+[Unit]
+Description=MQTT -> InfluxDB bridge (at-least-once, local WAL)
+Documentation=https://github.com/zc0350/InfluxDB_mqtt_plugin
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mqttbridge
+Group=mqttbridge
+WorkingDirectory=/var/lib/mqtt-influx-bridge
+Environment=BRIDGE_CONFIG=/etc/mqtt-influx-bridge/config.toml
+# INFLUX_TOKEN / MQTT_PASSWORD / PRODUCT_KEY 等凭据放这个文件，权限 0600
+EnvironmentFile=-/etc/mqtt-influx-bridge/bridge.env
+ExecStart=/opt/mqtt-influx-bridge/venv/bin/mqtt-influx-bridge run
+Restart=always
+RestartSec=3
+
+# SIGTERM 触发优雅退出：停止订阅 -> 等 in-flight 落库 -> 刷完 WAL 才退出。
+# 超时上限要大于 writer.batch_flush 的最坏重试时间，否则 SIGKILL 会打断 WAL。
+TimeoutStopSec=120
+KillSignal=SIGTERM
+SendSIGKILL=no
+
+# ---- 加固 ----
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+# WAL 与配置目录需要写/读，其余全部只读
+ReadWritePaths=/var/lib/mqtt-influx-bridge
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

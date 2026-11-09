@@ -1,0 +1,64 @@
+name: mqtt-influx-bridge
+
+services:
+  influxdb3:
+    image: ${INFLUXDB3_IMAGE:-influxdb:3-core}
+    # 显式写死 entrypoint/command：官方镜像的默认 CMD 各版本不一致，不依赖它。
+    entrypoint: ["influxdb3"]
+    command:
+      - serve
+      - --node-id=${NODE_ID:-node0}
+      - --object-store=file
+      - --data-dir=/var/lib/influxdb3
+      - --without-auth
+    ports:
+      # 默认只监听宿主机回环：--without-auth 时 8181 等于免鉴权的读写入口
+      - "${INFLUXDB3_BIND:-127.0.0.1}:${INFLUXDB3_PORT:-8181}:8181"
+    volumes:
+      - influxdb3-data:/var/lib/influxdb3
+    shm_size: 128mb
+    restart: unless-stopped
+    stop_grace_period: 60s
+    # 官方没公布 Core 的内存下限；1g 是给「写入 + 偶尔查询」留的余量，
+    # 容器被 OOM kill 的表现是桥接器一片 connection refused，所以宁可给高一点。
+    mem_limit: 1g
+
+  mosquitto:
+    image: ${MQTT_IMAGE:-eclipse-mosquitto:2}
+    ports:
+      - "${MQTT_BIND:-0.0.0.0}:${MQTT_PORT:-1883}:1883"
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./mosquitto/passwd:/mosquitto/config/passwd
+      - mosquitto-data:/mosquitto/data
+      - mosquitto-log:/mosquitto/log
+    restart: unless-stopped
+
+  bridge:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.bridge
+    image: mqtt-influx-bridge:local
+    env_file:
+      - ./bridge.env
+    environment:
+      BRIDGE_CONFIG: /config/config.toml
+    volumes:
+      # 配置目录只读挂载：改完 config.toml 只需 restart bridge
+      - ./config:/config:ro
+      # docker compose exec 不会重放 env_file，所以把同一个文件挂进容器，
+      # 脚本里的 bexec() 先 source 它再执行，保证 exec 出来的进程与 1 号进程同环境
+      - ./bridge.env:/bridge.env:ro
+      - bridge-data:/data
+    depends_on:
+      - influxdb3
+      - mosquitto
+    restart: unless-stopped
+    # 与 systemd TimeoutStopSec 对齐：等 in-flight 与 WAL 刷完再 SIGKILL
+    stop_grace_period: 120s
+
+volumes:
+  influxdb3-data:
+  mosquitto-data:
+  mosquitto-log:
+  bridge-data:

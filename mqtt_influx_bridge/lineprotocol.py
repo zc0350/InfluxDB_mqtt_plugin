@@ -1,14 +1,13 @@
-"""MQTT payload -> InfluxDB line protocol（时间戳统一为纳秒）。"""
+"""line protocol 原语：转义、时间戳归一、值格式化、单行拼装。"""
 from __future__ import annotations
 
 import json
 import math
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from decimal import Context, Decimal, InvalidOperation, ROUND_DOWN, localcontext
 from typing import Any
-
-from .config import FormatConfig
 
 
 class ParseError(ValueError):
@@ -19,6 +18,24 @@ TYPES = {"float", "int", "bool", "str", "auto"}
 _TOPIC_RE = re.compile(r"^@topic\[(\d+)\]$")
 _LP_TS_RE = re.compile(r"\s(-?\d+)\s*$")
 _UNIT_FACTOR = {"ns": 1, "us": 1_000, "ms": 1_000_000, "s": 1_000_000_000}
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+_ONE_US = timedelta(microseconds=1)
+# 换算用十进制，39 位有效数字够 19 位纳秒整数再带 9 位小数
+_NS_CTX = Context(prec=39, rounding=ROUND_DOWN)
+
+
+def _as_decimal(value: Any) -> Decimal:
+    """float 在 1.8e18 附近的最小刻度是 256ns，纳秒时间戳过一遍 float 会把相差 1ns
+    的两个点变成同一个点（IOx 按 tagset+time 合并），所以全程不做 float 转换。"""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return Decimal(value)
+    try:
+        d = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError, TypeError) as e:
+        raise ParseError(f"非法时间戳 {value!r}: {e}") from e
+    if not d.is_finite():
+        raise ParseError(f"非法时间戳 {value!r}")
+    return d
 
 
 def timestamp_to_ns(value: Any, unit: str = "auto") -> int:
@@ -30,32 +47,19 @@ def timestamp_to_ns(value: Any, unit: str = "auto") -> int:
             raise ParseError(f"无法解析 ISO 8601 时间戳 {value!r}: {e}") from e
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return int(dt.timestamp() * 1_000_000_000)
-    try:
-        n = int(float(value))
-    except (TypeError, ValueError) as e:
-        raise ParseError(f"非法时间戳 {value!r}: {e}") from e
+        return int((dt - _EPOCH) // _ONE_US) * 1_000
+    d = _as_decimal(value)
     if unit == "auto":
-        a = abs(n)
-        factor = 1_000_000_000 if a < 5e9 else 1_000_000 if a < 5e12 else 1_000 if a < 5e15 else 1
+        a = abs(d)
+        factor = 1_000_000_000 if a < 5_000_000_000 else 1_000_000 if a < 5_000_000_000_000 else 1_000 if a < 5_000_000_000_000_000 else 1
     else:
         factor = _UNIT_FACTOR[unit]
-    return int(n * factor)
+    with localcontext(_NS_CTX):
+        return int(d * factor)
 
 
-def _esc_measurement(s: Any) -> str:
-    return str(s).replace(",", r"\,").replace(" ", r"\ ")
-
-
-def _esc_key(s: Any) -> str:
-    return str(s).replace(",", r"\,").replace("=", r"\=").replace(" ", r"\ ")
-
-
-def _esc_string(s: Any) -> str:
-    return '"' + str(s).replace("\\", r"\\").replace('"', r'\"') + '"'
-
-
-def _resolve(spec: str, obj: Any, topic: str) -> Any:
+def resolve_path(spec: str, obj: Any, topic: str) -> Any:
+    """按 `a.b` / `a.0` 取 payload 值，`@topic[N]` 取 topic 分段。"""
     m = _TOPIC_RE.match(spec)
     if m:
         parts = topic.split("/")
@@ -75,7 +79,7 @@ def _resolve(spec: str, obj: Any, topic: str) -> Any:
     return cur
 
 
-def _split_field_spec(spec: str) -> tuple[str, str]:
+def split_field_spec(spec: str) -> tuple[str, str]:
     if ":" in spec:
         path, typ = spec.rsplit(":", 1)
         if typ in TYPES:
@@ -83,7 +87,7 @@ def _split_field_spec(spec: str) -> tuple[str, str]:
     return spec, "auto"
 
 
-def _format_value(value: Any, typ: str) -> str | None:
+def format_value(value: Any, typ: str) -> str | None:
     if value is None:
         return None
     if typ == "auto":
@@ -107,9 +111,24 @@ def _format_value(value: Any, typ: str) -> str | None:
             if isinstance(value, str):
                 return "true" if value.strip().lower() in ("true", "1", "yes", "on") else "false"
             return "true" if bool(value) else "false"
-        return _esc_string(value)
+        return as_string_field(value)
     except (TypeError, ValueError) as e:
         raise ParseError(f"字段值 {value!r} 转 {typ} 失败: {e}") from e
+
+
+def as_string_field(value: Any) -> str:
+    """双引号字段：数组/对象按 JSON 序列化，内部引号与反斜杠按 line protocol 规则转义。"""
+    if isinstance(value, (list, dict)):
+        value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return '"' + str(value).replace("\\", r"\\").replace('"', r'\"') + '"'
+
+
+def _esc_measurement(s: Any) -> str:
+    return str(s).replace(",", r"\,").replace(" ", r"\ ")
+
+
+def _esc_key(s: Any) -> str:
+    return str(s).replace(",", r"\,").replace("=", r"\=").replace(" ", r"\ ")
 
 
 def build_line(measurement: str, tags: dict[str, str], fields: dict[str, str], ts_ns: int) -> str:
@@ -121,71 +140,10 @@ def build_line(measurement: str, tags: dict[str, str], fields: dict[str, str], t
     return f"{head} {field_part} {ts_ns}"
 
 
-def _normalize_lp(line: str, fmt: FormatConfig) -> str:
+def normalize_line(line: str, unit: str) -> str:
+    """lineprotocol 透传时把行尾时间戳统一换算成纳秒；缺失则用接收时刻。"""
     m = _LP_TS_RE.search(line)
     if m:
-        ts = timestamp_to_ns(int(m.group(1)), fmt.timestamp_unit)
+        ts = timestamp_to_ns(int(m.group(1)), unit)
         return line[: m.start()].rstrip() + f" {ts}"
     return line.rstrip() + f" {time.time_ns()}"
-
-
-def _build_from_json(item: dict, fmt: FormatConfig, topic: str) -> str:
-    ts_ns = None
-    if fmt.timestamp_path:
-        raw_ts = _resolve(fmt.timestamp_path, item, topic)
-        if raw_ts is not None:
-            ts_ns = timestamp_to_ns(raw_ts, fmt.timestamp_unit)
-    if ts_ns is None:
-        ts_ns = time.time_ns()
-
-    measurement = fmt.measurement
-    if fmt.measurement_path:
-        dynamic = _resolve(fmt.measurement_path, item, topic)
-        if dynamic:
-            measurement = str(dynamic)
-
-    tags: dict[str, str] = dict(fmt.static_tags)
-    for key, path in fmt.tags.items():
-        v = _resolve(path, item, topic)
-        if v is not None:
-            tags[key] = str(v)
-    for key, idx in fmt.topic_tags.items():
-        parts = topic.split("/")
-        if 0 <= idx < len(parts):
-            tags[key] = parts[idx]
-
-    fields: dict[str, str] = {}
-    for key, spec in fmt.fields.items():
-        path, typ = _split_field_spec(spec)
-        v = _resolve(path, item, topic)
-        if v is not None:
-            formatted = _format_value(v, typ)
-            if formatted is not None:
-                fields[key] = formatted
-    if not fields:
-        raise ParseError("消息未解析出任何 field")
-    return build_line(measurement, tags, fields, ts_ns)
-
-
-def parse_payload(raw: bytes | str, fmt: FormatConfig, topic: str) -> list[str]:
-    try:
-        text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
-    except UnicodeDecodeError as e:
-        raise ParseError(f"payload 非 UTF-8: {e}") from e
-    if not text.strip():
-        raise ParseError("payload 为空")
-
-    if fmt.type == "lineprotocol":
-        return [_normalize_lp(line, fmt) for line in text.splitlines() if line.strip()]
-
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as e:
-        raise ParseError(f"JSON 解析失败: {e}") from e
-    items = data if isinstance(data, list) else [data]
-    out = []
-    for item in items:
-        if not isinstance(item, dict):
-            raise ParseError("JSON 消息必须是对象或对象数组")
-        out.append(_build_from_json(item, fmt, topic))
-    return out

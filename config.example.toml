@@ -1,8 +1,9 @@
 # 复制为 config.toml 后修改。敏感值建议用环境变量覆盖（见 README）。
+# 一条 [[route]] = 一类 topic -> 一张表；按声明顺序匹配，首个命中生效。
 [mqtt]
 host = "127.0.0.1"
 port = 1883
-topics = ["sensors/+/telemetry"]
+topics = []                           # 留空 = 自动订阅所有 [[route]].topics 的并集
 qos = 1
 client_id = "influx-mqtt-bridge-01"   # 必须固定且全局唯一，持久会话靠它恢复
 persistent_session = true
@@ -22,22 +23,57 @@ org = ""                              # v2 必填
 token = ""                            # 建议用 INFLUX_TOKEN 环境变量
 username = ""                         # v1 basic auth
 password = ""
+auto_create_database = true           # 启动时建库/建 bucket（幂等，失败只告警）
+retention_period = ""                 # 建库时的保留期，如 30d；库已存在则不生效，v1 忽略
 timeout_seconds = 10
 no_sync = false                       # v3；false = InfluxDB WAL 持久化后才返回 2xx
 accept_partial = false                # v3；false = 整批原子，避免部分成功后重试造成重复点
 gzip = true
 insecure_skip_verify = false
 
-[format]
-type = "json"                         # json | lineprotocol
-measurement = "sensor_data"
-# measurement_path = "type"          # 可选：从 payload 动态取表名
-timestamp_path = "ts"                # 必填：从 payload 取时间戳，保证重投幂等
-timestamp_unit = "ms"                # ns | us | ms | s | auto | datetime
+[mapping]
+year_tz_offset_minutes = 480          # 分表后缀按哪个时区切周期；0 = UTC
+substitutions = { productKey = "sensors" }   # topic 里的 ${productKey} 取值；缺省按 + 处理
+
+# 自动映射：payload 里未被 tags / fields 占用的 key 全部自动成 field，
+# 完整 payload 另存 blob_field，原始 topic 存 topic_field。
+[[route]]
+name = "telemetry"
+topics = ["${productKey}/+/telemetry"]
+measurement = "sensor_data"           # 分表时实际写 sensor_data_2026 / sensor_data_202611
+year_table = true
+table_period = "year"                 # year -> _2026，month -> _202611（year_table=false 时忽略）
+timestamp_path = "ts"                 # 决定行时间戳 + 落哪张分表，重投靠它幂等
+timestamp_unit = "ms"                 # ns | us | ms | s | auto | datetime
+mode = "auto"
 static_tags = { source = "mqtt" }
-tags = { device = "device_id", site = "location" }   # tag 名 = payload 路径
-fields = { temperature = "temp:float", humidity = "hum:float", online = "online:bool", seq = "seq:int" }
-topic_tags = { device_from_topic = 1 }               # tag 名 = topic 分段下标
+tags = { device = "device_id", site = "location" }   # tag 名 = payload 路径 / @topic[N]
+blob_field = "data"                   # "" = 不存原始 JSON
+topic_field = "topic"                 # "" = 不存 topic
+type_policy = "infer"                 # infer = 数值转 float；string = 全部转字符串（零类型冲突）
+key_case = "lower"                    # lower = deviceCode -> devicecode
+exclude_keys = []                     # 自动模式下要忽略的 key，如 ["rawFrame"]
+
+# 手动映射：只有列出的字段会入库，其余 payload key 丢弃（仍可保留 blob_field 兜底）。
+# [[route]]
+# name = "strict"
+# topics = ["strict/+/data"]
+# measurement = "strict_data"
+# year_table = false
+# timestamp_path = "meta.ts"
+# timestamp_unit = "datetime"
+# mode = "explicit"
+# tags = { device = "@topic[1]" }     # 从 topic 分段取 tag
+# fields = { temperature = "meta.temp:float", online = "flags.up:bool", seq = "seq:int" }
+
+# 设备直接发 line protocol 时原样透传，仅把行尾时间戳归一到纳秒。
+# [[route]]
+# name = "passthrough"
+# topics = ["lp/+/data"]
+# type = "lineprotocol"
+# measurement = "unused"
+# year_table = false
+# timestamp_unit = "s"                # 原始时间戳已是纳秒时设为 ns，避免二次换算
 
 [wal]
 path = "./data/bridge.db"
@@ -52,6 +88,8 @@ max_retries = 0                       # 0 = 无限重试；超限转入 DLQ
 ack_mode = "persisted"                # persisted | written（见 README）
 ack_timeout_seconds = 120
 when_full = "block"                   # block = 等待并暂不 ACK；drop = 转 DLQ 后 ACK
+split_on_reject = true                # 整批被 4xx 拒时二分定位坏行，只丢坏行
+max_split_probes = 64
 
 [log]
 level = "INFO"

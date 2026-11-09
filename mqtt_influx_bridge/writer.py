@@ -45,10 +45,21 @@ class HttpClient:
         return http.client.HTTPConnection(self.host, self.port, timeout=self.timeout)
 
     def post(self, path: str, body: bytes, headers: dict[str, str]) -> tuple[int, bytes]:
+        return self.request("POST", path, body, headers)
+
+    def get(self, path: str, headers: dict[str, str]) -> tuple[int, bytes]:
+        return self.request("GET", path, None, headers)
+
+    def delete(self, path: str, headers: dict[str, str]) -> tuple[int, bytes]:
+        return self.request("DELETE", path, None, headers)
+
+    def request(
+        self, method: str, path: str, body: bytes | None, headers: dict[str, str]
+    ) -> tuple[int, bytes]:
         if self._conn is None:
             self._conn = self._new_conn()
         try:
-            self._conn.request("POST", self.base_path + path, body=body, headers=headers)
+            self._conn.request(method, self.base_path + path, body=body, headers=headers)
             resp = self._conn.getresponse()
             data = resp.read()
             return resp.status, data
@@ -63,6 +74,18 @@ class HttpClient:
             except Exception:
                 pass
             self._conn = None
+
+
+def auth_header(cfg: InfluxConfig) -> str:
+    """三代的鉴权头不同：v1 Basic(username/password)，v2 Token，v3 Bearer。"""
+    if cfg.version == "v1" and cfg.username:
+        raw = f"{cfg.username}:{cfg.password}".encode()
+        return "Basic " + base64.b64encode(raw).decode()
+    if cfg.version == "v2" and cfg.token:
+        return f"Token {cfg.token}"
+    if cfg.version == "v3" and cfg.token:
+        return f"Bearer {cfg.token}"
+    return ""
 
 
 class InfluxWriter:
@@ -86,13 +109,9 @@ class InfluxWriter:
 
     def headers(self) -> dict[str, str]:
         h = {"Content-Type": "text/plain; charset=utf-8"}
-        if self.cfg.version == "v1" and self.cfg.username:
-            raw = f"{self.cfg.username}:{self.cfg.password}".encode()
-            h["Authorization"] = "Basic " + base64.b64encode(raw).decode()
-        elif self.cfg.version == "v2" and self.cfg.token:
-            h["Authorization"] = f"Token {self.cfg.token}"
-        elif self.cfg.version == "v3" and self.cfg.token:
-            h["Authorization"] = f"Bearer {self.cfg.token}"
+        auth = auth_header(self.cfg)
+        if auth:
+            h["Authorization"] = auth
         if self.cfg.gzip:
             h["Content-Encoding"] = "gzip"
         return h
@@ -113,6 +132,56 @@ class InfluxWriter:
         self.http.close()
 
 
+def _isolate_rejected(rows: list[Row], writer: InfluxWriter, wal: Wal, cfg: WriterConfig) -> str:
+    """整批被 4xx 拒绝后二分定位坏行：好行落库、单行确认坏的进 DLQ、判不出的退回重试。
+
+    InfluxDB 3 在 accept_partial=false 下会因为一行字段类型冲突拒掉整批，
+    不做隔离就会让一条毒药消息把同批上千行好数据一起拖进 DLQ。
+    """
+    ok: list[Row] = []
+    bad: list[tuple[Row, str]] = []
+    undecided: list[Row] = []
+    stack: list[list[Row]] = [rows]
+    probes = 0
+    while stack:
+        group = stack.pop()
+        try:
+            writer.write([r.line for r in group])
+        except PermanentError as e:
+            if len(group) == 1:
+                bad.append((group[0], str(e)))
+            elif probes < cfg.max_split_probes:
+                probes += 1
+                mid = len(group) // 2
+                stack.append(group[:mid])
+                stack.append(group[mid:])
+            else:
+                undecided.extend(group)
+        except TransientError as e:
+            # DB 转为不可用，剩余分组不再判定，避免把好数据误判成坏数据
+            undecided.extend(group)
+            for rest in stack:
+                undecided.extend(rest)
+            stack.clear()
+            log.warning("隔离过程中写入中断（%s），%d 行退回重试", e, len(undecided))
+        else:
+            ok.extend(group)
+
+    if ok:
+        wal.delete([r.id for r in ok])
+    for row, reason in bad:
+        wal.to_dlq([row], f"permanent: {reason}")
+    if undecided:
+        wal.defer([r.id for r in undecided], cfg.retry_base_ms, cfg.retry_max_ms)
+    log.error(
+        "整批被拒后二分隔离（%d 次探测）：%d 行已落库 / %d 行进 DLQ / %d 行待重试",
+        probes, len(ok), len(bad), len(undecided),
+    )
+    if bad:
+        return "dlq"
+    return "retry" if undecided else "ok"
+
+
 def flush_once(
     wal: Wal,
     writer: InfluxWriter,
@@ -124,12 +193,16 @@ def flush_once(
     if not rows:
         return 0
     ids = [r.id for r in rows]
+    lines = [r.line for r in rows]
     try:
-        writer.write([r.line for r in rows])
+        writer.write(lines)
     except PermanentError as e:
-        wal.to_dlq(rows, f"permanent: {e}")
-        outcome = "dlq"
-        log.error("整批写入被拒绝，%d 行转入 DLQ：%s", len(rows), e)
+        if cfg.split_on_reject and cfg.max_split_probes > 0 and len(rows) > 1:
+            outcome = _isolate_rejected(rows, writer, wal, cfg)
+        else:
+            wal.to_dlq(rows, f"permanent: {e}")
+            outcome = "dlq"
+            log.error("整批写入被拒绝，%d 行转入 DLQ：%s", len(rows), e)
     except TransientError as e:
         if cfg.max_retries and any(r.attempts + 1 >= cfg.max_retries for r in rows):
             wal.to_dlq(rows, f"retry limit: {e}")

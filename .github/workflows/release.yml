@@ -35,7 +35,8 @@ jobs:
           VERSION="${GITHUB_REF_NAME:-${INPUT_VERSION:-snapshot}}"
           rm -rf dist/bundle && mkdir -p dist/bundle/mqtt_influx_bridge
           cp -r mqtt_influx_bridge/*.py dist/bundle/mqtt_influx_bridge/ 2>/dev/null || true
-          cp config.example.toml README.md requirements.txt LICENSE dist/bundle/
+          cp config.example.toml config.tt1000.toml deploy.md README.md requirements.txt LICENSE dist/bundle/
+          cp -r deploy dist/bundle/deploy
           find dist/bundle -name '__pycache__' -type d -prune -exec rm -rf {} +
           cd dist/bundle
           zip -r "../mqtt-influx-bridge-${VERSION}.zip" .

@@ -13,10 +13,12 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from .admin import AdminClient, BackendError
 from .config import Config, MqttConfig
-from .lineprotocol import ParseError, parse_payload
+from .lineprotocol import ParseError
+from .routing import parse_payload
 from .wal import Wal
-from .writer import InfluxWriter, flush_once
+from .writer import InfluxWriter, TransientError, flush_once
 
 log = logging.getLogger(__name__)
 
@@ -119,8 +121,9 @@ class Bridge:
         if failed:
             log.error("MQTT 连接失败: %s", rc)
             return
-        log.info("MQTT 已连接，订阅 %s (qos=%d)", self.cfg.mqtt.topics, self.cfg.mqtt.qos)
-        for topic in self.cfg.mqtt.topics:
+        topics = self.cfg.subscribe_topics
+        log.info("MQTT 已连接，订阅 %s (qos=%d)，路由 %d 条", topics, self.cfg.mqtt.qos, len(self.cfg.routes))
+        for topic in topics:
             client.subscribe(topic, qos=self.cfg.mqtt.qos)
 
     def on_disconnect(self, *args) -> None:
@@ -133,7 +136,7 @@ class Bridge:
         qos = getattr(msg, "qos", 0)
         self.stats.received += 1
         try:
-            lines = parse_payload(msg.payload, self.cfg.format, topic)
+            lines = parse_payload(msg.payload, self.cfg.routes, self.cfg.mapping, topic)
         except ParseError as e:
             self.stats.parse_errors += 1
             raw = (
@@ -240,10 +243,27 @@ class Bridge:
 
     # ---------- 生命周期 ----------
 
+    def _ensure_backend(self) -> None:
+        """启动时把库/bucket 备好（幂等）。
+
+        失败只告警不退出：不丢数靠本地 WAL，不靠这一次调用。
+        """
+        if not self.cfg.influx.auto_create_database:
+            return
+        admin = AdminClient(self.cfg.influx)
+        try:
+            state, detail = admin.ensure_database(self.cfg.influx.retention_period)
+            log.info("目标库就绪 %s -> %s", state, detail)
+        except (TransientError, BackendError, ValueError) as e:
+            log.warning("自动建库未成功（%s），继续启动；需要时手动跑 init-db", e)
+        finally:
+            admin.close()
+
     def request_stop(self) -> None:
         self._stop.set()
 
     def start(self) -> None:
+        self._ensure_backend()
         self._client = self._factory(
             self.cfg.mqtt, self.on_connect, self.on_message, self.on_disconnect
         )
@@ -254,7 +274,7 @@ class Bridge:
         c = self.cfg.mqtt
         log.info(
             "启动桥接 mqtt=%s:%d topics=%s -> influx %s (%s) ack_mode=%s qos=%d",
-            c.host, c.port, c.topics, self.cfg.influx.url,
+            c.host, c.port, self.cfg.subscribe_topics, self.cfg.influx.url,
             self.cfg.influx.version, self.cfg.writer.ack_mode, c.qos,
         )
         self._client.connect_async(c.host, c.port, c.keepalive)

@@ -128,5 +128,76 @@ class TestFlushOnce(unittest.TestCase):
         self.assertEqual(self.wal.stats()["dlq"], 1)
 
 
+class ScriptWriter:
+    """按行内容判定成败的假 writer：批内只要有 BAD 行就整批 400。"""
+
+    def __init__(self, fail_after: int | None = None):
+        self.calls: list[list[str]] = []
+        self.fail_after = fail_after
+
+    def write(self, lines: list[str]) -> None:
+        self.calls.append(list(lines))
+        if self.fail_after is not None and len(self.calls) > self.fail_after:
+            raise TransientError("db down")
+        if any("BAD" in line for line in lines):
+            raise PermanentError("invalid column type for column 'v'")
+
+    def close(self) -> None:
+        pass
+
+
+class TestRejectIsolation(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.wal = Wal(Path(self.tmp.name) / "q.db")
+        self.cfg = WriterConfig(batch_size=10, retry_base_ms=0, retry_max_ms=0, max_retries=0)
+
+    def tearDown(self):
+        self.wal.close()
+        self.tmp.cleanup()
+
+    def _flush(self, writer):
+        outcomes: list[str] = []
+        n = flush_once(self.wal, writer, self.cfg, lambda o, i: outcomes.append(o))
+        return n, outcomes, writer.calls
+
+    def test_only_the_bad_row_is_dropped(self):
+        self.wal.append(["m v=1 1", "m BAD=1 2", "m v=3 3", "m v=4 4"], "t")
+        n, outcomes, calls = self._flush(ScriptWriter())
+        self.assertEqual(n, 4)
+        self.assertEqual(outcomes, ["dlq"])
+        self.assertEqual(self.wal.pending_count(), 0)
+        self.assertEqual(self.wal.stats()["dlq"], 1)
+        dlq_line = self.wal.dlq_rows()[0][1]
+        self.assertIn("BAD", dlq_line)
+        self.assertGreater(len(calls), 1)          # 确实做了二分而不是整批丢弃
+        self.assertTrue(all("BAD" not in c for c in calls[1:]))
+
+    def test_split_disabled_drops_whole_batch(self):
+        self.cfg.split_on_reject = False
+        self.wal.append(["m v=1 1", "m BAD=1 2"], "t")
+        n, outcomes, calls = self._flush(ScriptWriter())
+        self.assertEqual(outcomes, ["dlq"])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.wal.stats()["dlq"], 2)
+
+    def test_transient_failure_during_isolation_defers_instead_of_dlq(self):
+        writer = ScriptWriter(fail_after=1)      # 整批被拒后，下一次请求库就挂了
+        self.wal.append(["m v=1 1", "m BAD=1 2", "m v=3 3"], "t")
+        n, outcomes, _ = self._flush(writer)
+        self.assertEqual(outcomes, ["retry"])
+        self.assertEqual(self.wal.pending_count(), 3)   # 未判定的行都留着重试
+        self.assertEqual(self.wal.stats()["dlq"], 0)
+
+    def test_probe_limit_keeps_undecided_rows(self):
+        self.cfg.max_split_probes = 1
+        writer = ScriptWriter()
+        self.wal.append(["m v=1 1", "m v=2 2", "m BAD=1 3", "m BAD=2 4"], "t")
+        flush_once(self.wal, writer, self.cfg)
+        self.assertEqual(self.wal.pending_count(), 2)   # 判不出坏行就不丢，下一轮继续二分
+        self.assertEqual(self.wal.stats()["dlq"], 0)
+        self.assertEqual([r.line for r in self.wal.fetch(10)], ["m BAD=1 3", "m BAD=2 4"])
+
+
 if __name__ == "__main__":
     unittest.main()

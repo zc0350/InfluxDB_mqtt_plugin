@@ -1,0 +1,122 @@
+# 容器内使用的桥接配置（挂载为 /config/config.toml，只读）。
+# bootstrap.sh 会把本文件复制成 config/config.toml；改完执行
+#   docker compose restart bridge
+# 地址类项在 bridge.env 里已用环境变量覆盖（MQTT_HOST=mosquitto、INFLUX_URL=http://influxdb3:8181），
+# 所以这里的默认值面向「宿主机裸跑」，两处不冲突。
+
+[mqtt]
+host = "127.0.0.1"
+port = 1883
+topics = []                            # 留空 = 自动订阅下面所有 [[route]].topics
+qos = 1
+client_id = "influx-bridge-tt1000-01"  # 必须固定且全局唯一：持久会话靠它找回积压消息
+persistent_session = true
+username = ""
+password = ""
+keepalive = 60
+tls_ca = ""
+
+[influx]
+version = "v3"
+url = "http://127.0.0.1:8181"
+database = "mqtt"
+token = ""
+auto_create_database = true                 # 启动时建库（幂等；失败只告警，不影响启动）
+retention_period = ""                       # 建库时的保留期，如 30d；库已存在则不生效，v1 忽略
+timeout_seconds = 10
+no_sync = false                        # true = 未落盘就返回 2xx，崩溃会丢数，别开
+accept_partial = false                 # 整批原子，配合 writer.split_on_reject 二分定位坏行
+gzip = true
+
+[mapping]
+year_tz_offset_minutes = 480           # 分表后缀按 UTC+8 切：2026-11-30 23:30+08 仍写 _202611
+substitutions = {}                     # 留空则 ${productKey} 按 + 处理（订阅全部产品）
+
+# 列策略：本文件与 config.tt1000.toml 同源，用 mode="explicit" 只建查询要用的列，
+# 其余 key 只进 data blob。Core 没有 JSON 函数也没有 backfill，blob 里的东西查不了，
+# 所以加维度只能改 fields 后往前生效。想全自动展开把 mode 改回 "auto"。
+
+# 1) 设备上行：status / alarms 共用一张按月分表
+[[route]]
+name = "uplink"
+topics = ["${productKey}/+/data"]      # TODO 换成设备实际发布 topic（deploy.md §11 问题 1）
+measurement = "mqtt_data"
+year_table = true
+table_period = "month"                 # year -> _2026，month -> _202611
+timestamp_path = "time"
+timestamp_unit = "auto"
+mode = "explicit"
+tags = { event = "event", devicecode = "deviceCode", imei = "imei" }
+static_tags = {}
+fields = { code = "code:float", door_num = "door_num" }
+blob_field = "data"
+topic_field = "topic"
+key_case = "lower"
+
+# 2) 控制端下行命令 -> device_control_{年}{月}
+[[route]]
+name = "control"
+topics = ["${productKey}/+/control"]
+measurement = "device_control"
+year_table = true
+table_period = "month"
+timestamp_path = "time"
+timestamp_unit = "auto"
+mode = "explicit"
+tags = { event = "action", devicecode = "deviceCode" }
+static_tags = { direction = "downlink" }
+fields = { uuid = "uuid:str", code = "code:float" }
+blob_field = "data"
+topic_field = "topic"
+key_case = "lower"
+
+# 3) 设备对命令的回执 -> 与下行同表，靠 direction 区分
+[[route]]
+name = "response"
+topics = ["${productKey}/+/response/+"]
+measurement = "device_control"
+year_table = true
+table_period = "month"
+timestamp_path = "time"
+timestamp_unit = "auto"
+mode = "explicit"
+tags = { event = "action", devicecode = "deviceCode" }
+static_tags = { direction = "uplink" }
+fields = { uuid = "uuid:str", code = "code:float" }
+blob_field = "data"
+topic_field = "topic"
+key_case = "lower"
+
+# 4) 兜底：没被上面命中的 topic 也落一张表，避免新设备/新 topic 静默进 DLQ
+[[route]]
+name = "fallback"
+topics = ["#"]
+measurement = "mqtt_unknown"
+year_table = true
+table_period = "month"
+timestamp_path = "time"
+timestamp_unit = "auto"
+mode = "explicit"                      # 未知结构不猜列，只存 blob + topic
+tags = { devicecode = "deviceCode" }
+static_tags = { matched = "false" }
+blob_field = "data"
+topic_field = "topic"
+
+[wal]
+path = "./data/bridge.db"              # 容器里由 WAL_PATH 覆盖为 /data/bridge.db
+max_pending = 500000
+
+[writer]
+batch_size = 1000
+flush_interval_ms = 200
+retry_base_ms = 500
+retry_max_ms = 30000
+max_retries = 0                        # 0 = 无限重试；>0 超限转 DLQ
+ack_mode = "persisted"
+when_full = "block"
+split_on_reject = true                 # 一行字段类型冲突不拖垮整批
+max_split_probes = 64
+
+[log]
+level = "INFO"
+stats_interval_seconds = 30

@@ -17,3 +17,9 @@ build/
 # 本地运维/记忆目录
 .workbuddy/
 *.log
+
+# 部署时生成的凭据与实配置（示例文件 *.example 要提交）
+deploy/.env
+deploy/bridge.env
+deploy/config/config.toml
+deploy/mosquitto/passwd

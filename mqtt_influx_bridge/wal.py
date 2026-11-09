@@ -156,6 +156,40 @@ class Wal:
                 (line[:2000], topic, reason[:500], now, now),
             )
 
+    def dlq_rows(self, limit: int = 20) -> list[tuple[int, str, str, str]]:
+        """最近若干条死信：(dlq_id, line, topic, reason)，供 status / 排障使用。"""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT id, line, topic, reason FROM dlq ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [(int(r[0]), str(r[1] or ""), str(r[2] or ""), str(r[3] or "")) for r in rows]
+
+    def requeue_dlq(self, dlq_id: int) -> bool:
+        """把一条死信放回待写队列。用于修好路由或字段类型冲突之后人工重放。"""
+        now = time.time()
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._db.execute("SELECT line, topic FROM dlq WHERE id=?", (dlq_id,)).fetchone()
+                if row is None:
+                    self._db.execute("COMMIT")
+                    return False
+                self._db.execute(
+                    "INSERT INTO pending(line, topic, received_at, next_retry) VALUES (?, ?, ?, 0)",
+                    (row[0], row[1], now),
+                )
+                self._db.execute("DELETE FROM dlq WHERE id=?", (dlq_id,))
+                self._db.execute("COMMIT")
+                return True
+            except Exception:
+                self._db.execute("ROLLBACK")
+                raise
+
+    def drop_dlq(self, dlq_id: int) -> bool:
+        """确认放弃一条死信。"""
+        with self._lock:
+            return self._db.execute("DELETE FROM dlq WHERE id=?", (dlq_id,)).rowcount > 0
+
     def exists_any(self, ids: list[int]) -> bool:
         with self._lock:
             for chunk in _chunks(ids):
