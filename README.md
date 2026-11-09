@@ -218,4 +218,4 @@ python -m build                      # 生成 dist/*.whl 与 dist/*.tar.gz
 pip install dist/*.whl               # 安装后可用 mqtt-influx-bridge 命令
 ```
 
-版本号在 `pyproject.toml` 与 `mqtt_influx_bridge/__init__.py.__version__` 两处保持一致；打 tag 用 `git tag v0.1.0 && git push --tags`。
+版本号在 `pyproject.toml` 与 `mqtt_influx_bridge/__init__.py.__version__` 两处保持一致；发版用 `git tag -a v0.2.0 -m "v0.2.0" && git push origin main v0.2.0`（推 tag 会触发 Release 流水线并发布 GitHub Release）。

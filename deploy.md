@@ -224,7 +224,7 @@ sudo -u influxdb3 influxdb3 create database mqtt          # 要保留期就加 -
 sudo useradd -r -m -d /var/lib/mqtt-influx-bridge mqttbridge
 sudo python3 -m venv /opt/mqtt-influx-bridge/venv
 cd /path/to/InfluxDB_tell && sudo /opt/mqtt-influx-bridge/venv/bin/pip install .
-#   离线机器：先 python -m build，再 pip install dist/mqtt_influx_bridge-0.1.0-py3-none-any.whl
+#   离线机器：先 python -m build，再 pip install dist/mqtt_influx_bridge-0.2.0-py3-none-any.whl
 sudo mkdir -p /etc/mqtt-influx-bridge /var/lib/mqtt-influx-bridge
 sudo cp deploy/config/config.toml.example /etc/mqtt-influx-bridge/config.toml
 sudo cp deploy/bridge.env.example /etc/mqtt-influx-bridge/bridge.env
