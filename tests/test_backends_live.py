@@ -38,34 +38,30 @@ def _cfg() -> InfluxConfig:
     )
 
 
-def _first_int(doc) -> int | None:
-    """在 JSON 响应里找第一个整数 —— count(*) 的结果位置各家不同，值本身只有一个。"""
-    if isinstance(doc, bool):
-        return None
-    if isinstance(doc, int):
-        return doc
-    if isinstance(doc, list):
-        for item in doc:
-            got = _first_int(item)
-            if got is not None:
-                return got
-    if isinstance(doc, dict):
-        for item in doc.values():
-            got = _first_int(item)
-            if got is not None:
-                return got
-    return None
-
-
 def _count(text: str, version: str) -> int | None:
+    """只认 count 列，不能抓响应里的第一个整数：v1 的 statement_id 和 v2 的 table
+    都是 0，且都排在真正的计数前面，抓第一个整数会把「写进去 3 行」读成 0。"""
     if version == "v2":
-        rows = list(csv.DictReader(io.StringIO(text)))
-        for row in rows:
-            for key in ("_value", "count", "result"):
-                if row.get(key, "").strip().isdigit():
-                    return int(row[key])
-        return _first_int([[int(v) for v in row.values() if v.strip().isdigit()] for row in rows])
-    return _first_int(json.loads(text))
+        # Flux CSV 默认带 #datatype / #group / #default 三行注解，真正的表头在它们后面。
+        rows = [r for r in csv.reader(io.StringIO(text)) if r and not r[0].startswith("#")]
+        if len(rows) < 2 or "_value" not in rows[0]:
+            return None
+        i = rows[0].index("_value")
+        # count() 按 series 分组：3 个 dev tag 就是 3 行 _value=1，要加起来才是总点数。
+        values = [int(row[i]) for row in rows[1:]
+                  if len(row) > i and row[i].strip().lstrip("-").isdigit()]
+        return sum(values) if values else None
+    doc = json.loads(text)
+    if version == "v1":
+        doc = [dict(zip(s.get("columns") or [], values))
+               for res in doc.get("results", [])
+               for s in res.get("series", [])
+               for values in s.get("values") or []]
+    for row in doc:
+        for name, value in row.items():
+            if name.startswith("count") and isinstance(value, (int, float)):
+                return int(value)
+    return None
 
 
 @unittest.skipUnless(os.environ.get("LIVE_INFLUX_URL"), "未设 LIVE_INFLUX_URL，跳过真机冒烟")
@@ -97,13 +93,14 @@ class TestLiveBackend(unittest.TestCase):
 
         # 各家都是「写入即可见」（v3 的 no_sync=false 已等 WAL），不需要 sleep；
         # 但真机偶发跨节点可见性延迟，给 5 次机会免得 CI 抖。
-        got = None
+        got, raw = None, ""
         for _ in range(5):
-            got = _count(self.admin.query(self.count_sql()), self.version)
+            raw = self.admin.query(self.count_sql())
+            got = _count(raw, self.version)
             if got == 3:
                 break
             time.sleep(1)
-        self.assertEqual(got, 3, f"查询结果：{self.admin.query(self.count_sql())}")
+        self.assertEqual(got, 3, f"查询结果：{raw}")
 
         self.assertIn(self.table, self.admin.tables())
         self._cleanup_table()
@@ -146,17 +143,61 @@ class TestLiveIdempotentOverwrite(unittest.TestCase):
                    f' |> filter(fn: (r) => r._measurement == "{table}") |> count()')
         else:
             sql = f'SELECT count(*) FROM "{table}"'
-        got = None
+        got, raw = None, ""
         for _ in range(5):
-            got = _count(admin.query(sql), cfg.version)
+            raw = admin.query(sql)
+            got = _count(raw, cfg.version)
             if got == 1:
                 break
             time.sleep(1)
-        self.assertEqual(got, 1)
+        self.assertEqual(got, 1, f"查询结果：{raw}")
         try:
             admin.drop_table(table, hard=True)
         except (UnsupportedBackend, BackendError):
             pass
+
+
+class TestCountParsing(unittest.TestCase):
+    """钉住三家 count 响应的形状：v1/v3 是真机样本，v2 按 Flux 默认注解构造。不需要后端。"""
+
+    V1 = json.dumps({"results": [{"statement_id": 0, "series": [
+        {"name": "live_smoke_1794236204", "columns": ["time", "count_temp"],
+         "values": [["1970-01-01T00:00:00Z", 3]]}]}]})
+    V2 = (
+        "#datatype,string,long,dateTime:RFC3339,dateTime:RFC3339,dateTime:RFC3339,long,string,string\r\n"
+        "#group,false,false,true,true,false,false,true,true\r\n"
+        "#default,_result,,,,,,,\r\n"
+        ",result,table,_start,_stop,_time,_value,_measurement,dev\r\n"
+        ",,0,2026-11-09T14:00:00Z,2026-11-09T15:00:00Z,2026-11-09T15:00:00Z,1,live_smoke_1,d0\r\n"
+        ",,1,2026-11-09T14:00:00Z,2026-11-09T15:00:00Z,2026-11-09T15:00:00Z,1,live_smoke_1,d1\r\n"
+        ",,2,2026-11-09T14:00:00Z,2026-11-09T15:00:00Z,2026-11-09T15:00:00Z,1,live_smoke_1,d2\r\n"
+    )
+    V3 = '[{"count(*)":83}]'
+
+    def test_v1_reads_count_column_not_statement_id(self):
+        self.assertEqual(_count(self.V1, "v1"), 3)
+
+    def test_v1_single_point(self):
+        self.assertEqual(_count(self.V1.replace(", 3]", ", 1]"), "v1"), 1)
+
+    def test_v2_sums_the_per_series_counts(self):
+        self.assertEqual(_count(self.V2, "v2"), 3)
+
+    def test_v2_single_series(self):
+        one = "\r\n".join(self.V2.split("\r\n")[:5]) + "\r\n"
+        self.assertEqual(_count(one, "v2"), 1)
+
+    def test_v2_without_annotations(self):
+        plain = "\r\n".join(line for line in self.V2.split("\r\n") if not line.startswith("#"))
+        self.assertEqual(_count(plain, "v2"), 3)
+
+    def test_v3_reads_count_star(self):
+        self.assertEqual(_count(self.V3, "v3"), 83)
+
+    def test_no_rows_is_none_not_zero(self):
+        self.assertIsNone(_count('{"results":[{"statement_id":0}]}', "v1"))
+        self.assertIsNone(_count("\r\n".join(self.V2.split("\r\n")[:4]) + "\r\n", "v2"))
+        self.assertIsNone(_count("[]", "v3"))
 
 
 if __name__ == "__main__":
