@@ -209,6 +209,55 @@ bash deploy/scripts/backup.sh      # 停写 → tar 三个数据卷 + 配置凭�
 
 适合单机、想少一层虚拟化的场景。三个服务：influxdb3、mosquitto、bridge。
 
+### 5.0 一键安装脚本（推荐）
+
+`deploy/scripts/install.sh` 把下面的手动步骤自动化：**下载 InfluxDB 3 Core 官方二进制（校验 SHA256）→ 建 venv 装桥接器 → 配置 mosquitto → 写两个 systemd unit → 建库 → 启动 → 自检**。
+
+```bash
+# 在一台全新的 Linux (systemd) 上，以 root 执行
+sudo bash deploy/scripts/install.sh \
+  --mqtt-pass '强密码' \
+  --product-key TT1000          # 单产品收紧订阅面；留空 = 订阅所有产品
+
+# 已有外部 broker / 已有 InfluxDB：跳过 mosquitto
+sudo bash deploy/scripts/install.sh --no-broker --mqtt-pass '强密码'
+
+# 离线机器：先在有网机器 build，再指定本地 wheel
+sudo bash deploy/scripts/install.sh --bridge-whl ./dist/mqtt_influx_bridge-0.4.0-py3-none-any.whl
+```
+
+`--help` 列出全部参数（版本、库名、保留期、监听地址、MQTT 端口/账号、productKey）。环境变量 `INFLUXDB_VER` / `DB_NAME` / `RETENTION` / `HTTP_BIND` / `MQTT_PORT` / `MQTT_USER` / `MQTT_PASS` / `PRODUCT_KEY` 同样生效。
+
+**幂等性**：重复执行不会覆盖你改过的 `config.toml`、`bridge.env`、`mosquitto/passwd`；已安装的 influxdb3 会跳过下载；只 reconcile 服务状态（enable + start）。要改密码只能手动改 `bridge.env` 与 `mosquitto/passwd` 两处。
+
+**内存自适应**（这是脚本相比下面手写 unit 的核心价值）：`influxdb3 serve` 的三个内存 flag 默认是整机总内存的百分比（20%/50%/20%），只压 cgroup 不写绝对值 → 进程按大机器的比例申请 → 被 OOM kill，在桥接器侧表现成一片 connection refused。脚本读 `/proc/meminfo`，按本机内存把 `--exec-mem-pool-size` / `--force-snapshot-mem-size` / `--file-cache-size` 和 `MemoryHigh/MemoryMax` 全算成绝对值写死（小机器按 50%、大机器按 60% 预算）。换机器重跑脚本即可重算。
+
+**落地路径**：
+
+| 路径 | 内容 | 权限 |
+|---|---|---|
+| `/usr/local/bin/influxdb3` | Core 静态二进制 | 0755 |
+| `/opt/mqtt-influx-bridge/venv/` | 桥接器 venv | root 拥有 |
+| `/etc/mqtt-influx-bridge/config.toml` | 路由配置（从样例生成，改后 restart） | mqttbridge |
+| `/etc/mqtt-influx-bridge/bridge.env` | 凭据与地址覆盖 | 0600 |
+| `/etc/influxdb3/influxdb3-core.env` | influxdb3 追加 flag | 0600 |
+| `/etc/systemd/system/{influxdb3-core,mqtt-influx-bridge}.service` | 两个 unit | root |
+| `/var/lib/influxdb3/data` / `/var/lib/mqtt-influx-bridge/bridge.db` | DB 数据 / WAL | 各自服务用户 |
+
+**自检**：脚本末尾打印三个服务状态并跑一次 `check`。日常巡检：
+
+```bash
+systemctl status influxdb3-core mqtt-influx-bridge mosquitto
+journalctl -u mqtt-influx-bridge -f
+BRIDGE=/opt/mqtt-influx-bridge/venv/bin/mqtt-influx-bridge
+sudo $BRIDGE -c /etc/mqtt-influx-bridge/config.toml status    # WAL 队列
+sudo $BRIDGE -c /etc/mqtt-influx-bridge/config.toml ping      # 后端探活
+```
+
+**注意**：默认 `--without-auth` 且只绑 `127.0.0.1:8181`（桥接器与 DB 同机）。要远程查询请加反代鉴权，或用 `--http-bind` 改绑定后再自行开启 token 鉴权 —— 别把无鉴权的 8181 直接暴露到公网。
+
+下面是从零手工安装的步骤，适合需要完全掌控每一步的场景。
+
 ```bash
 # 1) InfluxDB 3 Core：从官方仓库装包或下载二进制（Linux x86_64/arm64）
 sudo useradd -r -m -d /var/lib/influxdb3 influxdb3

@@ -4,6 +4,15 @@
 
 按 topic 路由到不同表、列按 `[[route]]` 显式声明、表名按年或按月分片（`mqtt_data_2026` / `mqtt_data_202611`）的完整配置与上线方案见 [deploy.md](deploy.md)；`deploy/` 下有 docker-compose 与 systemd 部署产物。
 
+**Linux 裸机一键安装**（同时装 InfluxDB 3 Core + 桥接器 + mosquitto，写 systemd 并启动）：
+
+```bash
+sudo bash deploy/scripts/install.sh --mqtt-pass '你的密码' --product-key TT1000
+# 已装 InfluxDB / 只想连外部 broker：加 --no-broker；完整参数见 --help
+```
+
+脚本幂等、不覆盖已有配置；内存参数按本机物理内存自适应。细节见 [deploy.md §5](deploy.md#5-部署形态-b裸机-systemd不用-docker)。
+
 ## 设计取舍
 
 官方 InfluxDB 3 的 MQTT Subscriber 插件是「定时触发 + 短连 + paho 自动 PUBACK」，ACK 早于落库。本实现把顺序反过来：
@@ -218,4 +227,4 @@ python -m build                      # 生成 dist/*.whl 与 dist/*.tar.gz
 pip install dist/*.whl               # 安装后可用 mqtt-influx-bridge 命令
 ```
 
-版本号在 `pyproject.toml` 与 `mqtt_influx_bridge/__init__.py.__version__` 两处保持一致；发版用 `git tag -a v0.3.0 -m "v0.3.0" && git push origin main v0.3.0`（推 tag 会触发 Release 流水线并发布 GitHub Release）。
+版本号在 `pyproject.toml` 与 `mqtt_influx_bridge/__init__.py.__version__` 两处保持一致；发版用 `git tag -a v0.4.0 -m "v0.4.0" && git push origin main v0.4.0`（推 tag 会触发 Release 流水线并发布 GitHub Release）。
