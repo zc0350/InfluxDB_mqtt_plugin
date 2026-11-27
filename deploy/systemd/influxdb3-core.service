@@ -57,12 +57,16 @@ ExecStart=/usr/local/bin/influxdb3 serve \
     --file-cache-size=4gb \
     --max-concurrent-queries=8 \
     --async-trigger-concurrency-limit=8 \
+    --query-file-limit=${INFLUXDB3_QUERY_FILE_LIMIT} \
     $INFLUXDB3_EXTRA_ARGS
 
 # 留一个空的默认值：EnvironmentFile 缺失时 systemd 会因未定义变量直接拒绝启动
 Environment=INFLUXDB3_EXTRA_ARGS=
+# 查询文件数上限单独开一个变量，确保改 env 文件一定落到 ExecStart（不依赖 CLI 是否读同名环境变量）。
+# 要调大就改 /etc/influxdb3/influxdb3-core.env 的 INFLUXDB3_QUERY_FILE_LIMIT，别再往 EXTRA_ARGS 里重复写这个 flag。
+Environment=INFLUXDB3_QUERY_FILE_LIMIT=432
 # 额外/试验参数写这里，一个词一个 flag，例：
-#   INFLUXDB3_EXTRA_ARGS=--query-file-limit=1000 --max-concurrent-queries=8
+#   INFLUXDB3_EXTRA_ARGS=--datafusion-max-parquet-fanout=2000 --max-concurrent-queries=8
 EnvironmentFile=-/etc/influxdb3/influxdb3-core.env
 
 # StateDirectory 自动创建 /var/lib/influxdb3/data 并 chown 给上面的 User（首启即可用）。

@@ -223,7 +223,7 @@ sudo bash deploy/scripts/install.sh \
 # v2/v3 开了鉴权：补 --influx-token；v2 还要在 bridge.env 里填 INFLUX_ORG
 # 离线机器：先在有网机器 build，再指定本地 wheel
 sudo bash deploy/scripts/install.sh --influx-url http://127.0.0.1:8086 --influx-version v2 \
-  --bridge-whl ./dist/mqtt_influx_bridge-0.4.1-py3-none-any.whl
+  --bridge-whl ./dist/mqtt_influx_bridge-0.4.2-py3-none-any.whl
 ```
 
 `--help` 列出全部参数（InfluxDB URL/代际/库名/保留期/token、MQTT 地址端口账号、productKey）。环境变量 `INFLUX_URL` / `INFLUX_VERSION` / `DB_NAME` / `RETENTION` / `INFLUX_TOKEN` / `MQTT_HOST` / `MQTT_PORT` / `MQTT_USER` / `MQTT_PASS` / `PRODUCT_KEY` 同样生效。
@@ -281,6 +281,27 @@ sudo systemctl daemon-reload && sudo systemctl enable --now mqtt-influx-bridge
 ```
 
 `deploy/systemd/mqtt-influx-bridge.service` 里已配好：`EnvironmentFile=/etc/mqtt-influx-bridge/bridge.env` 注入凭据（权限 0600）、`TimeoutStopSec=120` + `SIGTERM` 保证 WAL 刷完、`ReadWritePaths` 只放行 `/var/lib/mqtt-influx-bridge`、`MemoryMax=512M`。上面的 `serve` 是前台进程，`Ctrl+C` 停掉后照抄一份 influxdb3 的 unit（同样的 `--data-dir`，`Restart=always`）；官方未公布 Core 的最低 CPU/内存（文档只给 OS 要求），别把桥接器的 `MemoryMax=512M` 照搬给它。裸机上 `delete table` 与查询同理：服务在跑就能做。
+
+### 5.1 改了 influxdb3-core.env 但查询仍报文件数超限
+
+按顺序排查：
+
+```bash
+# 1) 确认实际生效的 unit 和它读的配置文件
+systemctl cat influxdb3-core | grep -E 'ExecStart|Environment|EnvironmentFile'
+
+# 2) 看进程真实命令行（不是“以为改了”，是看跑起来的参数）
+PID=$(systemctl show -p MainPID --value influxdb3-core)
+sudo tr '\0' '\n' < /proc/$PID/cmdline | grep query-file-limit
+```
+
+三种结果：
+
+- 没有 `--query-file-limit`：unit 还是旧版，或官方包 unit 不读 `.env`（它读 `/etc/influxdb3/influxdb3-core.conf`）。用本仓库 `deploy/systemd/influxdb3-core.service` 覆盖，或 `systemctl edit influxdb3-core` 写 drop-in，然后 `systemctl daemon-reload && systemctl restart influxdb3-core`。
+- 有这个 flag 但值还是 432：改的不是 unit 里 `EnvironmentFile=` 指向的那个文件；`systemctl show influxdb3-core -p EnvironmentFiles` 会打印实际路径。
+- 值正确仍报错：说明查的是另一个实例（比如 Docker 里那个），或单条 SQL 扫描的表/时间范围太大；先加时间谓词把窗口缩到 3 天内。
+
+本仓库 unit 已把上限单独做成 `INFLUXDB3_QUERY_FILE_LIMIT`（默认 432），由 `ExecStart` 直接引用，不依赖 CLI 是否读同名环境变量。改 `/etc/influxdb3/influxdb3-core.env` 后只需 `restart`，无需 `daemon-reload`；只有改 unit 本身才需要 `daemon-reload`。同一 flag 不要同时写在 `INFLUXDB3_EXTRA_ARGS` 里，重复会让 `influxdb3 serve` 直接退出。
 
 ## 6. 为什么没用官方 MQTT Subscriber 插件
 
